@@ -1,7 +1,9 @@
 """
 Core data pipeline for the Used Car Valuation & Price Regression project.
 
-Stage 1 (eda-and-cleaning): Data discovery and Pandas/Regex specification cleaning.
+Stages:
+1. eda-and-cleaning: Data discovery and Pandas/Regex specification cleaning.
+2. feature-engineering: Derived metrics, brand median imputation, and feature encoding.
 """
 
 from __future__ import annotations
@@ -12,6 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -194,3 +200,60 @@ def clean_specifications(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd
     df = df.dropna(subset=["price_lakh", "year"]).drop_duplicates().reset_index(drop=True)
     df["year"] = df["year"].astype(int)
     return df, pd.DataFrame(audit_rows), before_after.reset_index(drop=True)
+
+
+def _parse_owner_num(value: Any) -> int:
+    """Convert heterogeneous owner strings/codes into ordinal numeric ownership count."""
+    text = str(value).strip().lower()
+    if "test" in text or "unregistered" in text:
+        return 0
+    for keyword, rank in [("first", 1), ("second", 2), ("third", 3), ("fourth", 4), ("above", 4), ("4 or more", 4)]:
+        if keyword in text:
+            return rank
+    if text.isdigit():
+        digit = int(text)
+        return digit + 1 if digit <= 3 else digit
+    return 1
+
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add `vehicle_age`, `km_10k`, ordinal `owner_num`, and impute missing specs via brand medians."""
+    out = df.copy()
+    snapshot_year = int(out["year"].max())
+    out["vehicle_age"] = (snapshot_year - out["year"]).clip(lower=0)
+    out["km_10k"] = out["km_driven"] / 10_000.0
+    if "owner" in out.columns:
+        out["owner_num"] = out["owner"].apply(_parse_owner_num)
+
+    impute_cols = ["km_driven", "km_10k", "mileage_kmpl", "engine_cc", "power_bhp", "torque_nm", "seats"]
+    for col in impute_cols:
+        if col in out.columns:
+            brand_med = out.groupby("brand")[col].transform("median")
+            out[col] = out[col].fillna(brand_med).fillna(out[col].median())
+    return out
+
+
+def prepare_dataset(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load, Regex-clean, and feature-engineer a dataset CSV from `data/`."""
+    clean_df, audit_df, before_after = clean_specifications(csv_path)
+    return engineer_features(clean_df), audit_df, before_after
+
+
+def build_preprocessor(df: pd.DataFrame) -> Tuple[ColumnTransformer, List[str], List[str]]:
+    """Build a ColumnTransformer for numeric scaling and categorical one-hot encoding."""
+    num_candidates = ["vehicle_age", "km_driven", "engine_cc", "power_bhp", "mileage_kmpl", "torque_nm", "seats", "owner_num"]
+    cat_candidates = ["brand", "fuel_type", "transmission"]
+    num_feats = [c for c in num_candidates if c in df.columns and df[c].notna().any()]
+    cat_feats = [c for c in cat_candidates if c in df.columns and df[c].notna().any()]
+
+    pre = ColumnTransformer(
+        [
+            ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]), num_feats),
+            (
+                "cat",
+                Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", OneHotEncoder(handle_unknown="ignore", max_categories=40, sparse_output=False))]),
+                cat_feats,
+            ),
+        ]
+    )
+    return pre, num_feats, cat_feats
