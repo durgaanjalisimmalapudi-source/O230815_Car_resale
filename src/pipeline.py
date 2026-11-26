@@ -4,6 +4,7 @@ Core data pipeline for the Used Car Valuation & Price Regression project.
 Stages:
 1. eda-and-cleaning: Data discovery and Pandas/Regex specification cleaning.
 2. feature-engineering: Derived metrics, brand median imputation, and feature encoding.
+3. modeling-evaluation: OLS regression, multiple regression, and Random Forest confidence estimation.
 """
 
 from __future__ import annotations
@@ -14,8 +15,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -257,3 +263,139 @@ def build_preprocessor(df: pd.DataFrame) -> Tuple[ColumnTransformer, List[str], 
         ]
     )
     return pre, num_feats, cat_feats
+
+
+def run_ols_regression(df: pd.DataFrame, x_col: str) -> Dict[str, Any]:
+    """Fit simple OLS linear regression `price_lakh ~ x_col` with a 95% confidence band."""
+    work = df[[x_col, "price_lakh"]].dropna()
+    work = work[
+        (work["price_lakh"] <= work["price_lakh"].quantile(0.98))
+        & (work[x_col] <= work[x_col].quantile(0.98))
+    ]
+    x = work[x_col].to_numpy(dtype=float)
+    y = work["price_lakh"].to_numpy(dtype=float)
+    res = stats.linregress(x, y)
+
+    y_hat = res.intercept + res.slope * x
+    resid = y - y_hat
+    n = len(x)
+    s_err = np.sqrt(np.sum(resid ** 2) / max(n - 2, 1))
+    t_crit = stats.t.ppf(0.975, df=max(n - 2, 1))
+
+    x_grid = np.linspace(x.min(), x.max(), 80)
+    y_grid = res.intercept + res.slope * x_grid
+    ci_half = t_crit * s_err * np.sqrt((1.0 / n) + ((x_grid - x.mean()) ** 2 / max(np.sum((x - x.mean()) ** 2), 1e-12)))
+
+    return {
+        "n": n,
+        "slope": float(res.slope),
+        "intercept": float(res.intercept),
+        "r2": float(res.rvalue ** 2),
+        "pvalue": float(res.pvalue),
+        "mae_lakh": float(np.mean(np.abs(resid))),
+        "curve": pd.DataFrame(
+            {
+                "x": x_grid,
+                "fit": y_grid,
+                "ci_low": np.maximum(0.0, y_grid - ci_half),
+                "ci_high": y_grid + ci_half,
+            }
+        ),
+        "sample": work.sample(min(len(work), 1500), random_state=42),
+    }
+
+
+def run_multiple_regression(df: pd.DataFrame) -> Tuple[pd.DataFrame, float, float]:
+    """Fit `price_lakh ~ vehicle_age + km_10k + specs` with LinearRegression."""
+    num_cols = [
+        c
+        for c in ["vehicle_age", "km_10k", "engine_cc", "power_bhp", "mileage_kmpl", "owner_num"]
+        if c in df.columns and df[c].notna().any()
+    ]
+    cat_cols = [c for c in ["fuel_type", "transmission"] if c in df.columns and df[c].nunique() > 1]
+
+    X = pd.get_dummies(df[num_cols + cat_cols], drop_first=True, dtype=float)
+    y = df["price_lakh"].to_numpy(dtype=float)
+    model = LinearRegression().fit(X, y)
+    pred = model.predict(X)
+
+    labels = {
+        "vehicle_age": "Vehicle Age (+1 yr)",
+        "km_10k": "Odometer (+10,000 km)",
+        "engine_cc": "Engine (+1 cc)",
+        "power_bhp": "Power (+1 bhp)",
+        "mileage_kmpl": "Mileage (+1 kmpl)",
+        "owner_num": "Owner Count (+1)",
+    }
+    coef_df = pd.DataFrame(
+        {
+            "Feature": [labels.get(c, c.replace("_", ": ", 1)) for c in X.columns],
+            "Price Impact (Lakhs)": model.coef_,
+        }
+    )
+    return coef_df, float(r2_score(y, pred)), float(mean_absolute_error(y, pred))
+
+
+def train_resale_estimator(df: pd.DataFrame) -> Dict[str, Any]:
+    """Train a 100-tree Random Forest estimator; tree percentiles yield confidence bands."""
+    pre, num_feats, cat_feats = build_preprocessor(df)
+    feats = cat_feats + num_feats
+
+    X = df[feats]
+    y = df["price_lakh"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    X_tr_enc = pre.fit_transform(X_train)
+    X_te_enc = pre.transform(X_test)
+
+    rf = RandomForestRegressor(n_estimators=100, max_depth=16, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    rf.fit(X_tr_enc, y_train)
+
+    te_preds = rf.predict(X_te_enc)
+    return {
+        "preprocessor": pre,
+        "model": rf,
+        "features": feats,
+        "num_features": num_feats,
+        "cat_features": cat_feats,
+        "test_r2": float(r2_score(y_test, te_preds)),
+        "test_mae": float(mean_absolute_error(y_test, te_preds)),
+        "snapshot_year": int(df["year"].max()),
+    }
+
+
+def predict_with_confidence(bundle: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    """Predict resale value (INR Lakhs) plus 80% (P10-P90) and 90% (P5-P95) tree intervals."""
+    def _eval_batch(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        X_in = pd.DataFrame([{f: r.get(f, np.nan) for f in bundle["features"]} for r in rows])
+        X_enc = bundle["preprocessor"].transform(X_in)
+        trees = np.array([t.predict(X_enc) for t in bundle["model"].estimators_])
+        return (
+            trees.mean(axis=0),
+            np.percentile(trees, 10, axis=0),
+            np.percentile(trees, 90, axis=0),
+            np.percentile(trees, 5, axis=0),
+            np.percentile(trees, 95, axis=0),
+            trees,
+        )
+
+    mean, p10, p90, p05, p95, trees = _eval_batch([row])
+
+    ages = list(range(0, 16))
+    a_mean, a10, a90, a05, a95, _ = _eval_batch([{**row, "vehicle_age": a} for a in ages])
+    age_curve = pd.DataFrame({"age": ages, "est": a_mean, "p10": a10, "p90": a90, "p05": a05, "p95": a95})
+
+    kms = np.linspace(10_000, 180_000, 18)
+    k_mean, k10, k90, k05, k95, _ = _eval_batch([{**row, "km_driven": float(k)} for k in kms])
+    km_curve = pd.DataFrame({"km_10k": kms / 10_000.0, "est": k_mean, "p10": k10, "p90": k90, "p05": k05, "p95": k95})
+
+    return {
+        "estimate_lakh": float(mean[0]),
+        "lo80": float(p10[0]),
+        "hi80": float(p90[0]),
+        "lo90": float(p05[0]),
+        "hi90": float(p95[0]),
+        "tree_dist": trees[:, 0],
+        "age_curve": age_curve,
+        "km_curve": km_curve,
+    }
